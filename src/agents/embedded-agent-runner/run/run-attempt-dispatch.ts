@@ -7,10 +7,11 @@ import { attachModelProviderRuntimePluginHandle } from "../../../plugins/provide
 import { getGatewayContextResolver } from "../../../plugins/runtime/gateway-request-scope.js";
 import { createAgentHarnessTaskRuntimeScope } from "../../../tasks/agent-harness-task-runtime-scope.js";
 import { createTrajectoryRuntimeRecorder } from "../../../trajectory/runtime.js";
+import { resolveAdmittedRunActiveAssertion } from "../../admitted-run-context.js";
 import type { ToolOutcomeObserver } from "../../agent-tools.before-tool-call.js";
 import { resolveDelegationCapability } from "../../delegation-capability.js";
 import { resolveSessionGitCoauthorPrompt } from "../../git-coauthor-prompt.js";
-import { agentHarnessBuildsOpenClawTools } from "../../harness/selection.js";
+import { agentHarnessBuildsOpenClawTools } from "../../harness/tool-surface.js";
 import { appendIncognitoSystemPrompt } from "../../incognito-system-prompt.js";
 import { applyAuthHeaderOverride, applyLocalNoAuthHeaderOverride } from "../../model-auth.js";
 import { recordAdmittedModelRoutingDecision } from "../../model-routing-decision.js";
@@ -22,15 +23,15 @@ import { resolveSessionPlacementSandbox } from "../../session-placement-admissio
 import { resolveSessionSkillResourceSnapshot } from "../../session-placement-skill-resources.js";
 import { createToolTerminalObserver } from "../../tool-terminal-outcome.js";
 import {
-  createAdmittedGatewayToolCallerIdentity,
-  withGatewayToolCallerIdentity,
-} from "../../tools/gateway-caller-context.js";
-import { resolveAttemptWorkspaceSandbox } from "../../workspace-sandbox.js";
+  resolveAttemptWorkspaceSandbox,
+  resolveHarnessWorkspace,
+} from "../../workspace-sandbox.js";
 import type { EmbeddedRunReplayState } from "../replay-state.js";
 import { remapSkillReferencePaths } from "../sandbox-skills.js";
 import { prepareEmbeddedSkills } from "../skill-runtime.js";
 import { mapThinkingLevelForProvider } from "../utils.js";
 import { prepareExecApprovalContinuationForAttempt } from "./attempt-exec-approval-continuation.js";
+import { withPreparedEmbeddedGatewayTools } from "./attempt-gateway-tools.js";
 import { applyResolvedToolPromptFinalizer } from "./attempt-prompt-support.js";
 import { EMBEDDED_RUN_ATTEMPT_DISPATCH_STAGE } from "./attempt-stage-timing.js";
 import { resolveAttemptDispatchApiKey } from "./auth-store.js";
@@ -49,7 +50,7 @@ import type { EmbeddedRunAttemptParams } from "./types.js";
 
 type PreparedRuntime = Awaited<ReturnType<typeof prepareEmbeddedRunRuntime>>;
 type ContextEngine = Awaited<ReturnType<typeof resolveContextEngine>>;
-type SessionPromptState = ReturnType<typeof createEmbeddedRunSessionPromptState>;
+type SessionPromptState = Awaited<ReturnType<typeof createEmbeddedRunSessionPromptState>>;
 type TerminalRetryState = ReturnType<typeof createEmbeddedRunTerminalRetryState>;
 
 export async function prepareAndDispatchEmbeddedRunAttempt(input: {
@@ -350,7 +351,15 @@ export async function prepareAndDispatchEmbeddedRunAttempt(input: {
     readPath: path.posix.join(mount.containerPath, "SKILL.md"),
   }));
   if (pluginSandbox?.enabled && !pluginSandbox.readOnlyResourceMounts?.length && skillsSnapshot) {
-    const prepared = prepareEmbeddedSkills({
+    const assertActiveRun = resolveAdmittedRunActiveAssertion(
+      admittedRunContext,
+      attemptAbortController.signal,
+    );
+    const prepared = await prepareEmbeddedSkills({
+      assertCurrent: () => {
+        attemptAbortController.signal.throwIfAborted();
+        assertActiveRun?.();
+      },
       applySkillEnvironment: false,
       includeCodeModeSkills: false,
       attempt: {
@@ -380,13 +389,18 @@ export async function prepareAndDispatchEmbeddedRunAttempt(input: {
     },
   });
   const pluginRefresh = captureAgentPluginRuntimeRefresh();
-  const attemptParams: EmbeddedRunAttemptInternalParams = {
+  const attemptParams: EmbeddedRunAttemptInternalParams & {
+    agentId: string;
+    sessionKey: string;
+    agentHarnessId: string;
+  } = {
     pluginRuntimeRefreshPending: pluginRefresh.isPending,
     registerPluginRuntimeRefreshConsumer: (isCurrent) => {
       if (attemptControls.isCurrent()) {
         pluginRefresh.bindConsumer(() => attemptControls.isCurrent() && isCurrent());
       }
     },
+    pluginRuntimeRefreshMessages: params.pluginRuntimeRefreshMessages,
     permissionChange: input.permissionChange,
     admittedRunContext: params.admittedRunContext,
     startedAtMs: runInput.startedAtMs,
@@ -404,10 +418,9 @@ export async function prepareAndDispatchEmbeddedRunAttempt(input: {
     messageChannel: params.messageChannel,
     messageProvider: params.messageProvider,
     clientCaps: params.clientCaps,
+    gatewayUiCommandTarget: params.gatewayUiCommandTarget,
     pinnedWidgetAuthoring: params.pinnedWidgetAuthoring,
     toolBindings: params.toolBindings,
-    // Preserve the Gateway's tri-state capability; undefined hides both GitHub tools.
-    githubPublicationAvailable: params.githubPublicationAvailable,
     chatType: params.chatType,
     agentAccountId: params.agentAccountId,
     conversationRoutePeerId: params.conversationRoutePeerId,
@@ -439,11 +452,9 @@ export async function prepareAndDispatchEmbeddedRunAttempt(input: {
     sessionFile,
     ...(sessionManager ? { sessionManager } : { sessionTarget: resolvedSessionTarget }),
     trajectoryRecorder: trajectoryRecorder ?? undefined,
-    workspaceDir,
+    ...resolveHarnessWorkspace(workspaceDir, params, pluginWorkspace, pluginSandbox),
     bootstrapWorkspaceDir,
-    cwd: params.cwd,
     permissionMode: params.permissionMode,
-    sessionRoot: params.sessionRoot,
     requireWorkspaceOnly: params.requireWorkspaceOnly,
     requireWritableSandbox: params.requireWritableSandbox,
     agentDir,
@@ -566,6 +577,7 @@ export async function prepareAndDispatchEmbeddedRunAttempt(input: {
     reasoningLevel: params.reasoningLevel,
     toolResultFormat: resolvedToolResultFormat,
     toolProgressDetail: params.toolProgressDetail,
+    execSession: params.execSession,
     execOverrides: params.execOverrides,
     bashElevated: params.bashElevated,
     timeoutMs: params.timeoutMs,
@@ -639,6 +651,8 @@ export async function prepareAndDispatchEmbeddedRunAttempt(input: {
     forceRestartSafeTools: params.forceRestartSafeTools,
     forceCodeModeTools: params.forceCodeModeTools,
     codeModeOverride: params.codeModeOverride,
+    disableToolSearch: params.disableToolSearch,
+    sessionReadScopeKey: params.sessionReadScopeKey,
     forceMessageTool: params.forceMessageTool,
     enableHeartbeatTool: params.enableHeartbeatTool,
     forceHeartbeatTool: params.forceHeartbeatTool,
@@ -661,23 +675,10 @@ export async function prepareAndDispatchEmbeddedRunAttempt(input: {
     },
     prepareAssistantTranscriptMessage: params.prepareAssistantTranscriptMessage,
   };
-  const callerIdentity = createAdmittedGatewayToolCallerIdentity({
-    admittedRunContext: attemptParams.admittedRunContext,
-    agentId: workspaceResolution.agentId,
-    sessionKey: resolvedSessionKey,
-    turnSourceChannel: params.messageChannel ?? params.messageProvider,
-    turnSourceLocal:
-      !params.messageChannel &&
-      !params.messageProvider &&
-      params.cronCreatorAuthorityCapability?.callerOrigin.kind === "local"
-        ? true
-        : undefined,
-    turnSourceTo: params.currentMessagingTarget ?? params.currentChannelId,
-    turnSourceAccountId: params.agentAccountId,
-    turnSourceThreadId: params.currentThreadTs,
-  });
-  const rawAttempt = await withGatewayToolCallerIdentity(callerIdentity, () =>
-    runEmbeddedAttemptWithBackend(attemptParams, nativeSessionRuntime),
+  const rawAttempt = await withPreparedEmbeddedGatewayTools(
+    attemptParams,
+    attemptControls.isCurrent,
+    () => runEmbeddedAttemptWithBackend(attemptParams, nativeSessionRuntime),
   )
     .catch((err: unknown): never => {
       throw input.getPostCompactionAbortError() ?? err;
