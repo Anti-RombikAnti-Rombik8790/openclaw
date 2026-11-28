@@ -1,0 +1,305 @@
+import CoreGraphics
+import Foundation
+import OpenClawChatUI
+import OpenClawKit
+import SwiftUI
+
+extension RootTabs {
+    private static var sidebarPersistentWidthThreshold: CGFloat {
+        self.sidebarSplitIdealWidth + self.sidebarDetailMinimumWidth
+    }
+
+    static let sidebarSplitIdealWidth: CGFloat = 300
+    static let sidebarSplitMaximumWidth: CGFloat = 320
+    static let sidebarDetailMinimumWidth: CGFloat = 500
+    // Keep the web drawer's 86% reveal while using more of current iPhone widths.
+    static let sidebarDrawerMaximumWidth: CGFloat = 340
+    static let sidebarShowButtonAccessibilityIdentifier = "RootTabs.Sidebar.Show"
+    static let sidebarHideButtonAccessibilityIdentifier = "RootTabs.Sidebar.Hide"
+
+    enum SidebarDestination: String, CaseIterable, Hashable, Identifiable {
+        case chat
+        case activity
+        case systems
+        case workboard
+        case skillWorkshop
+        case instances
+        case sessions
+        case files
+        case dreaming
+        case usage
+        case cron
+        case desktop
+        case terminal
+        case settings
+        case gateway
+
+        var id: String {
+            rawValue
+        }
+
+        var title: String {
+            switch self {
+            case .chat: String(localized: "Chat")
+            case .activity: String(localized: "Activity")
+            case .systems: String(localized: "Systems")
+            case .workboard: String(localized: "Workboard")
+            case .skillWorkshop: String(localized: "Skill Workshop")
+            case .instances: String(localized: "Instances")
+            case .sessions: String(localized: "Sessions")
+            case .files: String(localized: "Files")
+            case .dreaming: String(localized: "Dreaming")
+            case .usage: String(localized: "Usage")
+            case .cron: String(localized: "Automations")
+            case .desktop: String(localized: "Desktop")
+            case .terminal: String(localized: "Terminal")
+            case .settings: String(localized: "Settings")
+            case .gateway: String(localized: "Settings / Gateway")
+            }
+        }
+
+        var sidebarTitle: String {
+            switch self {
+            case .gateway: String(localized: "Connection")
+            default: self.title
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .chat: "bubble.left"
+            case .activity: "waveform.path.ecg"
+            case .systems: "server.rack"
+            case .workboard: "folder"
+            case .skillWorkshop: "hammer"
+            case .instances: "dot.radiowaves.left.and.right"
+            case .sessions: "bubble.left.and.bubble.right"
+            case .files: "folder.fill"
+            case .dreaming: "moon.stars"
+            case .usage: "gauge.with.dots.needle.33percent"
+            case .cron: "clock"
+            case .desktop: "display"
+            case .terminal: "terminal"
+            case .settings: "gearshape"
+            case .gateway: "gearshape"
+            }
+        }
+
+        var screen: SidebarScreen {
+            switch self {
+            case .activity: .dashboard(DashboardRouteMap.activityPagePath)
+            case .systems: .dashboard(DashboardRouteMap.systemsPagePath)
+            case .workboard: .dashboard(DashboardRouteMap.workboardPagePath)
+            case .skillWorkshop: .dashboard(DashboardRouteMap.skillWorkshopPagePath)
+            case .instances: .dashboard(DashboardRouteMap.devicesSettingsPath)
+            case .dreaming: .dashboard(DashboardRouteMap.dreamingPagePath)
+            case .usage: .dashboard(DashboardRouteMap.usagePagePath)
+            case .cron: .dashboard(DashboardRouteMap.cronJobsPagePath)
+            case .chat: .chat
+            case .sessions: .sessions
+            case .files: .files
+            case .desktop: .desktop
+            case .terminal: .terminal
+            case .settings: .settings
+            case .gateway: .gateway
+            }
+        }
+
+        var settingsRoute: SettingsRoute? {
+            self == .gateway ? .gateway : nil
+        }
+    }
+
+    enum SidebarScreen: Equatable {
+        case dashboard(String)
+        case chat, sessions, files, desktop, terminal, settings, gateway
+    }
+
+    static func notificationSettingsPath(servingEnabled: Bool, disclosureAccepted: Bool) -> String {
+        servingEnabled && disclosureAccepted
+            ? DashboardRouteMap.devicePermissionsSettingsPath
+            : DashboardRouteMap.deviceSettingsPath
+    }
+
+    enum SidebarLayoutMode: Equatable {
+        case drawer
+        case split
+    }
+
+    enum SidebarSessionPresentation: Equatable {
+        case chat
+        case dashboard
+    }
+
+    static func sidebarPresentation(for session: OpenClawChatSessionEntry) -> SidebarSessionPresentation {
+        session.boardFace == "dashboard" ? .dashboard : .chat
+    }
+
+    /// The sidebar needs regular space in both axes and enough usable detail width.
+    /// Keyboard avoidance changes height, not this width budget or the size classes.
+    static func sidebarLayoutMode(
+        containerSize: CGSize,
+        horizontalSizeClass: UserInterfaceSizeClass?,
+        verticalSizeClass: UserInterfaceSizeClass?,
+        usesAccessibilityText: Bool = false) -> SidebarLayoutMode
+    {
+        horizontalSizeClass == .regular && verticalSizeClass == .regular &&
+            !usesAccessibilityText && containerSize.width >= self.sidebarPersistentWidthThreshold
+            ? .split
+            : .drawer
+    }
+
+    static func sidebarVisibility(layoutMode: SidebarLayoutMode, splitPreference: Bool?) -> Bool {
+        layoutMode == .split ? (splitPreference ?? true) : false
+    }
+
+    static func sidebarWidth(containerWidth: CGFloat, isDrawerLayout: Bool) -> CGFloat {
+        if isDrawerLayout {
+            return min(self.sidebarDrawerMaximumWidth, containerWidth * 0.86)
+        }
+        return min(
+            self.sidebarSplitMaximumWidth,
+            max(self.sidebarSplitIdealWidth, containerWidth * 0.25),
+            max(0, containerWidth - self.sidebarDetailMinimumWidth))
+    }
+
+    static func sidebarContentOffset(
+        sidebarWidth: CGFloat,
+        isVisible: Bool,
+        dragOffset: CGFloat,
+        reduceMotion: Bool) -> CGFloat
+    {
+        guard !reduceMotion else { return 0 }
+        if isVisible {
+            return max(0, sidebarWidth + min(0, dragOffset))
+        }
+        // Closed: a positive drag is the interactive edge-open follow.
+        return max(0, min(sidebarWidth, dragOffset))
+    }
+
+    static func visibleSettingsRoute(
+        navigationPath: [SettingsRoute],
+        baseRoute: SettingsRoute?) -> SettingsRoute?
+    {
+        navigationPath.last ?? baseRoute
+    }
+
+    /// The destination header's sidebar control hides the sidebar only beside a visible
+    /// split sidebar; a drawer is dismissed from its own header, scrim, or swipe.
+    static func sidebarHeaderControlHidesSidebar(
+        isSidebarVisible: Bool,
+        layoutMode: SidebarLayoutMode) -> Bool
+    {
+        layoutMode == .split && isSidebarVisible
+    }
+
+    static func requestedInitialSidebarVisibility(arguments: [String]) -> Bool? {
+        guard let value = arguments.drop(while: { $0 != "--openclaw-sidebar-visibility" }).dropFirst().first
+        else { return nil }
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "visible", "show", "shown", "open", "true", "1":
+            return true
+        case "hidden", "hide", "closed", "false", "0":
+            return false
+        default:
+            return nil
+        }
+    }
+
+    enum StartupPresentationRoute: Equatable {
+        case none
+        case onboarding
+        case settings
+    }
+
+    static func startupPresentationRoute(
+        gatewayConnected: Bool,
+        hasConnectedOnce: Bool,
+        onboardingComplete: Bool,
+        hasExistingGatewayConfig: Bool,
+        shouldPresentOnLaunch: Bool) -> StartupPresentationRoute
+    {
+        if gatewayConnected {
+            return .none
+        }
+        // Saved gateway state survives independently of the onboarding markers.
+        // Explicit resets bypass this route through evaluateOnboardingPresentation(force:).
+        if hasExistingGatewayConfig {
+            return .none
+        }
+        if shouldPresentOnLaunch || !hasConnectedOnce || !onboardingComplete {
+            return .onboarding
+        }
+        return .settings
+    }
+
+    /// A pending registry read is not evidence of a fresh install.
+    static func shouldOfferFirstGatewaySetup(
+        hasConnectedOnce: Bool,
+        hasSavedGateway: Bool?,
+        hasRuntimeOrLegacyGatewayConfig: Bool) -> Bool
+    {
+        !hasConnectedOnce && hasSavedGateway == false && !hasRuntimeOrLegacyGatewayConfig
+    }
+
+    static func shouldPresentQuickSetup(
+        quickSetupDismissed: Bool,
+        showOnboarding: Bool,
+        hasPresentedSheet: Bool,
+        gatewayConnected: Bool,
+        hasExistingGatewayConfig: Bool,
+        discoveredGatewayCount: Int) -> Bool
+    {
+        guard !quickSetupDismissed else { return false }
+        guard !showOnboarding else { return false }
+        guard !hasPresentedSheet else { return false }
+        guard !gatewayConnected else { return false }
+        guard !hasExistingGatewayConfig else { return false }
+        return discoveredGatewayCount > 0
+    }
+
+    static let sidebarDestinations: [SidebarDestination] = [
+        .chat,
+        .workboard,
+        .usage,
+        .cron,
+        .sessions,
+        .activity,
+        .systems,
+        .skillWorkshop,
+        .instances,
+        .files,
+        .dreaming,
+        .desktop,
+        .terminal,
+    ]
+
+    /// Home (chat) is a fixed first row like the web sidebar; only these can be
+    /// pinned/unpinned by the user.
+    static let pinnableSidebarPages: [SidebarDestination] = sidebarDestinations.filter { $0 != .chat }
+
+    static let defaultPinnedSidebarPages: [SidebarDestination] = [.sessions, .cron, .usage]
+    static let pinnedSidebarPagesStorageKey = "sidebar.pinnedPages"
+
+    /// "" = never customized (defaults); "none" = user unpinned everything.
+    /// Storage order is the user's pin order (web parity); unknown or
+    /// unpinnable raw values are dropped.
+    static func pinnedSidebarPages(from storage: String) -> [SidebarDestination] {
+        let trimmed = storage.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return self.defaultPinnedSidebarPages }
+        if trimmed == "none" { return [] }
+        var seen = Set<String>()
+        return trimmed.split(separator: ",").compactMap { raw in
+            let value = String(raw)
+            guard seen.insert(value).inserted,
+                  let destination = SidebarDestination(rawValue: value),
+                  self.pinnableSidebarPages.contains(destination)
+            else { return nil }
+            return destination
+        }
+    }
+
+    static func pinnedSidebarPagesStorage(_ pages: [SidebarDestination]) -> String {
+        pages.isEmpty ? "none" : pages.map(\.rawValue).joined(separator: ",")
+    }
+}

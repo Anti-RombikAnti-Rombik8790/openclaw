@@ -517,6 +517,7 @@ final class NodeAppModel {
     var gatewaySetupRequestID: Int = 0
     private(set) var pendingAgentDeepLinkPrompt: AgentDeepLinkPrompt?
     private var pendingGatewaySetupLink: GatewayConnectDeepLink?
+    private(set) var approvalInboxNavigationRequestID = 0
     private(set) var pendingExecApprovalPrompt: ExecApprovalPrompt?
     private(set) var pendingExecApprovalPromptResolving: Bool = false
     private(set) var pendingExecApprovalPromptErrorText: String?
@@ -552,7 +553,10 @@ final class NodeAppModel {
     }
 
     var pendingApprovalAttentionRequests: [OpenClawChatAttentionRequest] {
-        self.pendingExecApprovalInboxItems.compactMap { item in
+        if self.isLocalChatFixtureEnabled, ScreenshotFixtureMode.sessionStatesEnabled {
+            return ScreenshotFixtureMode.sessionStateApprovals()
+        }
+        return self.pendingExecApprovalInboxItems.compactMap { item in
             let prompt = item.prompt
             guard self.isExecApprovalPromptCurrent(prompt),
                   let source = prompt.attentionSource,
@@ -573,8 +577,24 @@ final class NodeAppModel {
         }
     }
 
-    /// An uncertain resolution keeps approval actions frozen, but must not trap the
-    /// reviewer in a modal or Settings detail while canonical readback is unavailable.
+    func approvalTargetsSession(
+        sourceSessionKey: String?,
+        sourceAgentID: String?,
+        sessionKey: String,
+        agentID: String?) -> Bool
+    {
+        guard let sourceSessionKey else { return false }
+        return ChatSessionSidebarModel.attentionSourceMatchesSession(
+            source: sourceSessionKey,
+            sourceAgentID: sourceAgentID,
+            sessionKey: sessionKey,
+            mainSessionKey: self.mainSessionKey,
+            agentID: agentID,
+            sessionRoutingContract: self.chatSessionRoutingContract)
+    }
+
+    /// An uncertain resolution keeps approval actions frozen, but the reviewer can
+    /// still leave the request while canonical readback is unavailable.
     var pendingExecApprovalPromptCanDismiss: Bool {
         !self.pendingExecApprovalPromptResolving || self.pendingExecApprovalPromptErrorText != nil
     }
@@ -707,6 +727,9 @@ final class NodeAppModel {
     private var apnsLastRegisteredGatewayStableID: String?
     @ObservationIgnored private let pushRegistrationManager = PushRegistrationManager()
 
+    let sessionGroups = SessionGroupModel()
+    var personalSidebarPins = IOSSidebarPins()
+
     var operatorSession: GatewayNodeSession {
         self.operatorGateway
     }
@@ -814,6 +837,12 @@ final class NodeAppModel {
     let chatPresentation = IOSChatViewModelOwner()
     var agentAvatarImages: [String: UIImage] = [:]
     var loadedAgentAvatarRequest: IOSAgentAvatarRequest?
+    var resolvedAgentAvatarIDs: Set<String> = []
+    /// `agent.identity.get` results by agent id for `agentIdentitiesOwnerID`'s Gateway.
+    var agentIdentities: [String: IOSResolvedAgentIdentity] = [:]
+    var agentIdentitiesOwnerID: String?
+    /// Last known agents for `chatViewModelOwnerID`, read once per owner from the Gateway cache.
+    @ObservationIgnored var cachedAgentIdentitiesMemo: IOSCachedAgentIdentities?
     /// Request admission only; the connection controller owns the later handoff.
     var isGatewayPickerRequestInFlight = false
 
@@ -922,6 +951,22 @@ final class NodeAppModel {
               GatewayStableIdentifier.matches(cache.gatewayID, gatewayID)
         else { return }
         await cache.storeSessions(sessions, agentID: agentID)
+    }
+
+    func localChatCacheUsage() async throws -> OpenClawClientDatabases.GatewayCacheUsage {
+        try await self.requireChatCacheDatabases().gatewayCacheUsage()
+    }
+
+    func clearLocalChatCache() async throws -> OpenClawClientDatabases.GatewayCacheUsage {
+        try await self.requireChatCacheDatabases().clearGatewayCache()
+    }
+
+    private func requireChatCacheDatabases() throws -> OpenClawClientDatabases {
+        if self.clientDatabases == nil {
+            self.clientDatabases = Self.makeClientDatabases()
+        }
+        guard let clientDatabases else { throw CocoaError(.fileReadUnknown) }
+        return clientDatabases
     }
 
     /// Delete one forgotten gateway's cache and durable state, or both
@@ -1140,9 +1185,9 @@ final class NodeAppModel {
         mediaAuthorizationProvider: @escaping @MainActor () -> MediaAuthorizationSnapshot = { .current() })
     {
         if restoringSavedGatewayRoute, let stableID = GatewaySettingsStore.activeGatewayEntry()?.stableID {
+            // A cold launch opens this agent’s main chat. Only an in-app Gateway switch restores its focused chat.
             self.connectedGatewayID = stableID
             self.selectedAgentId = GatewaySettingsStore.loadGatewaySelectedAgentId(stableID: stableID)
-            self.focusedChatSessionKey = GatewaySettingsStore.loadGatewayFocusedChatSessionKey(stableID: stableID)
         }
         self.camera = camera
         self.preferredCameraFacing = Self.cameraFacingPreference(
@@ -1306,15 +1351,9 @@ final class NodeAppModel {
             self.isBackgrounded = false
             // Permission prompts and Settings changes return through activation.
             self.refreshMediaAuthorizationSnapshot()
-            if self.clientDatabases == nil {
-                // Recovery must run even after forgetting the final gateway;
-                // no chat facade may remain to initialize the container.
-                self.clientDatabases = Self.makeClientDatabases()
-            }
-            let registeredGatewayIDs = GatewaySettingsStore.loadGatewayRegistry().entries.map(\.stableID)
-            self.clientDatabases?.resolvePendingGatewayRemovals(
-                registeredGatewayIDs: registeredGatewayIDs)
             if let clientDatabases {
+                let registeredGatewayIDs = GatewaySettingsStore.loadGatewayRegistry().entries.map(\.stableID)
+                clientDatabases.resolvePendingGatewayRemovals(registeredGatewayIDs: registeredGatewayIDs)
                 let recoveredGatewayIDs = self.quarantinedChatOfflineGatewayIDs.filter {
                     !clientDatabases.hasPendingGatewayRemoval(gatewayID: $0.rawValue)
                 }
@@ -1322,9 +1361,13 @@ final class NodeAppModel {
                     self.quarantinedChatOfflineGatewayIDs.subtract(recoveredGatewayIDs)
                     self.chatTranscriptCacheGeneration &+= 1
                 }
+                clientDatabases.retryLegacyImport(registeredGatewayIDs: registeredGatewayIDs)
+            } else {
+                // Opening the owner already resolves removals before importing legacy state.
+                // Do not repeat that recovery (and its registry read) in this activation.
+                // Still open after forgetting the final gateway: no chat facade may remain.
+                self.clientDatabases = Self.makeClientDatabases()
             }
-            self.clientDatabases?.retryLegacyImport(
-                registeredGatewayIDs: registeredGatewayIDs)
             self.endBackgroundConnectionGracePeriod(reason: "scene_foreground")
             self.clearBackgroundReconnectSuppression(reason: "scene_foreground")
             var shouldStartGatewayHealthMonitor = self.operatorConnected
@@ -1904,6 +1947,14 @@ final class NodeAppModel {
         guard shouldContinue(), let payload = evt.payload else { return }
         switch evt.event {
         case "config.changed", "users.prefs.changed":
+            if evt.event == "users.prefs.changed" {
+                struct Changed: Decodable { let keys: [String] }
+                if (try? GatewayPayloadDecoding.decode(payload, as: Changed.self))?.keys
+                    .contains(IOSSidebarPins.preferenceKey) == true
+                {
+                    await self.refreshPersonalSidebarPins()
+                }
+            }
             // Persisted config writes (accent, session routing) must reach an
             // already-connected app; the protocol directs clients to re-read via
             // config.get, which the guarded branding refresh already does.
@@ -2505,7 +2556,7 @@ final class NodeAppModel {
         case OpenClawCameraCommand.list.rawValue:
             let devices = await camera.listDevices()
             struct Payload: Codable {
-                var devices: [CameraController.CameraDeviceInfo]
+                var devices: [OpenClawCameraDeviceInfo]
             }
             return try Self.successfulInvokeResponse(req, payload: Payload(devices: devices))
         case OpenClawCameraCommand.snap.rawValue:
@@ -3422,8 +3473,21 @@ extension NodeAppModel {
             defaultAgentID: self.gatewayDefaultAgentId)
     }
 
+    /// Chat speaks as the agent's resolved identity (`agent.identity.get`), like web
+    /// `assistantIdentity.name` (ui/src/app/assistant-identity.ts:41-58); the roster name
+    /// or id labels it until that identity arrives.
     var chatAgentName: String {
-        self.agentDisplayName(for: self.chatAgentId)
+        self.chatAgentDisplayName(for: self.chatAgentId)
+    }
+
+    func chatAgentDisplayName(for agentID: String) -> String {
+        // A cold start can draw the main chat before its routing identity has restored.
+        let agentID = agentID.trimmedNonEmpty ?? self.cachedAgentIdentities.defaultAgentID ?? agentID
+        if let identityName = self.agentIdentityName(for: agentID) { return identityName }
+        if let rosterName = self.displayAgents.first(where: { $0.id == agentID })?.name?.trimmedNonEmpty {
+            return rosterName
+        }
+        return self.agentDisplayName(for: agentID)
     }
 
     var chatAgentAvatarURL: String? {
@@ -4905,9 +4969,11 @@ extension NodeAppModel {
             error: error,
             preserving: self.operatorGatewayProblem ?? self.nodeGatewayProblem)
             ?? GatewayConnectionProblem.unmapped(error)
+        let url = self.activeGatewayConnectConfig?.url
         return GatewayConnectionIssue.addingEndpointGuidance(
             to: problem,
-            host: self.activeGatewayConnectConfig?.url.host)
+            host: url?.host,
+            port: url.map { $0.port ?? ($0.scheme == "wss" ? 443 : 80) })
     }
 
     private func resetNodeGatewayLoopStatusIfCurrent(routeGeneration: UInt64, stableID: String) {
@@ -5046,6 +5112,7 @@ extension NodeAppModel {
         let current = self.connection.operator.connectedInfo
         guard previous != current else { return }
         self.operatorAuthorityGeneration &+= 1
+        self.personalSidebarPins = IOSSidebarPins()
         let connected = current != nil
         guard connected != (previous != nil) else { return }
         guard connected else {
@@ -7634,6 +7701,30 @@ extension NodeAppModel {
         let connected = await waitForGatewayConnection(timeoutMs: 5000, pollMs: 250)
         self.locationWakeLogger.info(
             "Location wake post-check wakeId=\(wakeId, privacy: .public) connected=\(connected, privacy: .public)")
+    }
+
+    var hasAPNsDeviceToken: Bool {
+        self.apnsDeviceTokenHex?.isEmpty == false
+    }
+
+    /// Submission is not proof of delivery or Gateway acceptance.
+    var hasSubmittedNotificationRegistration: Bool {
+        guard self.gatewayConnected,
+              let token = apnsDeviceTokenHex,
+              !token.isEmpty
+        else { return false }
+        let stableID = self.activeGatewayConnectConfig?.effectiveStableID ?? self.connectedGatewayID ?? ""
+        return !Self.shouldPublishDirectAPNsRegistration(
+            token: token,
+            gatewayStableID: stableID,
+            lastToken: self.apnsLastRegisteredTokenHex,
+            lastGatewayStableID: self.apnsLastRegisteredGatewayStableID)
+    }
+
+    func retryNotificationRegistration(
+        shouldContinue: @escaping @MainActor @Sendable () -> Bool) async
+    {
+        await self.registerAPNsTokenIfNeeded(shouldContinue: shouldContinue)
     }
 
     func updateAPNsDeviceToken(_ tokenData: Data) {
